@@ -32,6 +32,7 @@ import nodeIconRouter from './node-icons'
 import nodeLoadMethodRouter from './node-load-methods'
 import nodesRouter from './nodes'
 import oauth2Router from './oauth2'
+import githubCopilotRouter from './github-copilot'
 import openaiAssistantsRouter from './openai-assistants'
 import openaiAssistantsFileRouter from './openai-assistants-files'
 import openaiAssistantsVectorStoreRouter from './openai-assistants-vector-store'
@@ -103,6 +104,7 @@ router.use('/node-icon', nodeIconRouter)
 router.use('/node-load-method', nodeLoadMethodRouter)
 router.use('/nodes', nodesRouter)
 router.use('/oauth2-credential', oauth2Router)
+router.use('/github-copilot', githubCopilotRouter)
 router.use('/openai-assistants', openaiAssistantsRouter)
 router.use('/openai-assistants-file', openaiAssistantsFileRouter)
 router.use('/openai-assistants-vector-store', openaiAssistantsVectorStoreRouter)

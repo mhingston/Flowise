@@ -1,6 +1,6 @@
 import { createPortal } from 'react-dom'
 import PropTypes from 'prop-types'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useDispatch } from 'react-redux'
 import { enqueueSnackbar as enqueueSnackbarAction, closeSnackbar as closeSnackbarAction } from '@/store/actions'
 import parser from 'html-react-parser'
@@ -19,6 +19,7 @@ import { IconHandStop, IconX } from '@tabler/icons-react'
 // API
 import credentialsApi from '@/api/credentials'
 import oauth2Api from '@/api/oauth2'
+import githubCopilotApi from '@/api/githubCopilot'
 
 // Hooks
 import useApi from '@/hooks/useApi'
@@ -52,6 +53,26 @@ const AddEditCredentialDialog = ({ show, dialogProps, onCancel, onConfirm, setEr
     const [credentialData, setCredentialData] = useState({})
     const [componentCredential, setComponentCredential] = useState({})
     const [shared, setShared] = useState(false)
+    const [deviceFlowData, setDeviceFlowData] = useState(null)
+    const [deviceFlowStatus, setDeviceFlowStatus] = useState('')
+    const [deviceFlowError, setDeviceFlowError] = useState('')
+    const [deviceFlowPolling, setDeviceFlowPolling] = useState(false)
+    const deviceFlowTimerRef = useRef(null)
+
+    const clearDeviceFlowTimer = () => {
+        if (deviceFlowTimerRef.current) {
+            clearTimeout(deviceFlowTimerRef.current)
+            deviceFlowTimerRef.current = null
+        }
+    }
+
+    const resetDeviceFlowState = () => {
+        clearDeviceFlowTimer()
+        setDeviceFlowData(null)
+        setDeviceFlowStatus('')
+        setDeviceFlowError('')
+        setDeviceFlowPolling(false)
+    }
 
     useEffect(() => {
         if (getSpecificCredentialApi.data) {
@@ -93,6 +114,7 @@ const AddEditCredentialDialog = ({ show, dialogProps, onCancel, onConfirm, setEr
     }, [getSpecificComponentCredentialApi.error])
 
     useEffect(() => {
+        resetDeviceFlowState()
         if (dialogProps.type === 'EDIT' && dialogProps.data) {
             // When credential dialog is opened from Credentials dashboard
             getSpecificCredentialApi.request(dialogProps.data.id)
@@ -112,9 +134,16 @@ const AddEditCredentialDialog = ({ show, dialogProps, onCancel, onConfirm, setEr
     }, [dialogProps])
 
     useEffect(() => {
-        if (show) dispatch({ type: SHOW_CANVAS_DIALOG })
-        else dispatch({ type: HIDE_CANVAS_DIALOG })
-        return () => dispatch({ type: HIDE_CANVAS_DIALOG })
+        if (show) {
+            dispatch({ type: SHOW_CANVAS_DIALOG })
+        } else {
+            dispatch({ type: HIDE_CANVAS_DIALOG })
+            resetDeviceFlowState()
+        }
+        return () => {
+            clearDeviceFlowTimer()
+            dispatch({ type: HIDE_CANVAS_DIALOG })
+        }
     }, [show, dispatch])
 
     const addNewCredential = async () => {
@@ -356,6 +385,166 @@ const AddEditCredentialDialog = ({ show, dialogProps, onCancel, onConfirm, setEr
         }
     }
 
+    const pollGitHubDeviceFlow = async (credentialId, deviceCode, intervalSeconds) => {
+        const scheduleNext = (nextIntervalSeconds) => {
+            clearDeviceFlowTimer()
+            deviceFlowTimerRef.current = setTimeout(() => {
+                pollGitHubDeviceFlow(credentialId, deviceCode, nextIntervalSeconds)
+            }, nextIntervalSeconds * 1000)
+        }
+
+        try {
+            const pollResp = await githubCopilotApi.pollDeviceFlow(credentialId, deviceCode)
+            const status = pollResp.data?.status
+
+            if (status === 'authorized') {
+                setDeviceFlowPolling(false)
+                setDeviceFlowStatus('Authorized')
+                enqueueSnackbar({
+                    message: 'GitHub device flow completed successfully',
+                    options: {
+                        key: new Date().getTime() + Math.random(),
+                        variant: 'success',
+                        action: (key) => (
+                            <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                <IconX />
+                            </Button>
+                        )
+                    }
+                })
+                onConfirm(credentialId)
+                return
+            }
+
+            if (status === 'slow_down') {
+                setDeviceFlowStatus('GitHub requested a slower polling interval.')
+                scheduleNext(intervalSeconds + 5)
+                return
+            }
+
+            if (status === 'authorization_pending') {
+                setDeviceFlowStatus('Waiting for authorization...')
+                scheduleNext(intervalSeconds)
+                return
+            }
+
+            throw new Error(pollResp.data?.message || 'Device flow failed')
+        } catch (error) {
+            setDeviceFlowPolling(false)
+            const message =
+                error.response?.data?.message ||
+                error.response?.data?.error_description ||
+                error.message ||
+                'Device flow failed'
+            setDeviceFlowError(message)
+            enqueueSnackbar({
+                message: `GitHub device flow failed: ${message}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+        }
+    }
+
+    const setGitHubDeviceFlow = async () => {
+        try {
+            resetDeviceFlowState()
+            setDeviceFlowPolling(true)
+
+            let credentialId = null
+            if (dialogProps.type === 'ADD') {
+                const obj = {
+                    name,
+                    credentialName: componentCredential.name,
+                    plainDataObj: credentialData
+                }
+                const createResp = await credentialsApi.createCredential(obj)
+                if (createResp.data) {
+                    credentialId = createResp.data.id
+                }
+            } else {
+                const saveObj = {
+                    name,
+                    credentialName: componentCredential.name
+                }
+
+                let plainDataObj = {}
+                for (const key in credentialData) {
+                    if (credentialData[key] !== REDACTED_CREDENTIAL_VALUE) {
+                        plainDataObj[key] = credentialData[key]
+                    }
+                }
+                if (Object.keys(plainDataObj).length) saveObj.plainDataObj = plainDataObj
+
+                const saveResp = await credentialsApi.updateCredential(credential.id, saveObj)
+                if (saveResp.data) {
+                    credentialId = credential.id
+                }
+            }
+
+            if (!credentialId) {
+                throw new Error('Failed to save credential')
+            }
+
+            const startResp = await githubCopilotApi.startDeviceFlow(credentialId)
+            if (!startResp.data?.success) {
+                throw new Error(startResp.data?.message || 'Failed to start GitHub device flow')
+            }
+
+            setDeviceFlowData(startResp.data)
+            setDeviceFlowStatus('Waiting for authorization...')
+
+            if (startResp.data?.verification_uri) {
+                const authWindow = window.open(
+                    startResp.data.verification_uri,
+                    '_blank',
+                    'width=600,height=700,scrollbars=yes,resizable=yes'
+                )
+                if (!authWindow) {
+                    enqueueSnackbar({
+                        message: 'Popup blocked. Please open the GitHub verification URL manually.',
+                        options: {
+                            key: new Date().getTime() + Math.random(),
+                            variant: 'warning',
+                            action: (key) => (
+                                <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                                    <IconX />
+                                </Button>
+                            )
+                        }
+                    })
+                }
+            }
+
+            const intervalSeconds = startResp.data?.interval || 5
+            pollGitHubDeviceFlow(credentialId, startResp.data.device_code, intervalSeconds)
+        } catch (error) {
+            setDeviceFlowPolling(false)
+            const message = error.response?.data?.message || error.message || 'GitHub device flow failed'
+            setDeviceFlowError(message)
+            enqueueSnackbar({
+                message: `GitHub device flow failed: ${message}`,
+                options: {
+                    key: new Date().getTime() + Math.random(),
+                    variant: 'error',
+                    persist: true,
+                    action: (key) => (
+                        <Button style={{ color: 'white' }} onClick={() => closeSnackbar(key)}>
+                            <IconX />
+                        </Button>
+                    )
+                }
+            })
+        }
+    }
+
     const component = show ? (
         <Dialog
             fullWidth
@@ -479,6 +668,69 @@ const AddEditCredentialDialog = ({ show, dialogProps, onCancel, onConfirm, setEr
                     componentCredential.inputs
                         .filter((inputParam) => inputParam.hidden !== true)
                         .map((inputParam, index) => <CredentialInputHandler key={index} inputParam={inputParam} data={credentialData} />)}
+
+                {!shared && componentCredential && componentCredential.name === 'githubCopilotApi' && (
+                    <Box sx={{ p: 2 }}>
+                        <Button
+                            variant='contained'
+                            color='secondary'
+                            onClick={() => setGitHubDeviceFlow()}
+                            disabled={!name || deviceFlowPolling}
+                        >
+                            {deviceFlowPolling ? 'Waiting for GitHub...' : 'Authenticate with GitHub Device Flow'}
+                        </Button>
+                    </Box>
+                )}
+                {!shared && componentCredential && componentCredential.name === 'githubCopilotApi' && deviceFlowData && (
+                    <Box sx={{ pl: 2, pr: 2 }}>
+                        <div
+                            style={{
+                                display: 'flex',
+                                flexDirection: 'column',
+                                borderRadius: 10,
+                                background: 'rgb(254,252,191)',
+                                padding: 10,
+                                marginTop: 10,
+                                marginBottom: 10
+                            }}
+                        >
+                            <Typography variant='overline'>GitHub Device Flow</Typography>
+                            <Typography variant='body2' sx={{ mb: 1 }}>
+                                Visit GitHub and enter the code below to authorize.
+                            </Typography>
+                            <OutlinedInput
+                                type='string'
+                                fullWidth
+                                value={deviceFlowData.user_code || ''}
+                                inputProps={{ readOnly: true }}
+                            />
+                            <OutlinedInput
+                                type='string'
+                                fullWidth
+                                sx={{ mt: 1 }}
+                                value={deviceFlowData.verification_uri || ''}
+                                inputProps={{ readOnly: true }}
+                            />
+                            <Button
+                                sx={{ mt: 1, alignSelf: 'flex-start' }}
+                                variant='outlined'
+                                onClick={() => window.open(deviceFlowData.verification_uri, '_blank')}
+                            >
+                                Open GitHub
+                            </Button>
+                            {deviceFlowStatus && (
+                                <Typography variant='caption' sx={{ mt: 1 }}>
+                                    Status: {deviceFlowStatus}
+                                </Typography>
+                            )}
+                            {deviceFlowError && (
+                                <Typography variant='caption' sx={{ mt: 0.5, color: 'error.main' }}>
+                                    {deviceFlowError}
+                                </Typography>
+                            )}
+                        </div>
+                    </Box>
+                )}
 
                 {!shared && componentCredential && componentCredential.name && componentCredential.name.includes('OAuth2') && (
                     <Box sx={{ p: 2 }}>
