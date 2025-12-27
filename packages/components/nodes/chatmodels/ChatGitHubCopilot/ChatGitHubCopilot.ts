@@ -7,6 +7,8 @@ import { getBaseClasses, getCredentialData, getCredentialParam } from '../../../
 const COPILOT_TOKEN_URL = 'https://api.github.com/copilot_internal/v2/token'
 const DEFAULT_BASE_URL = 'https://api.githubcopilot.com'
 const TOKEN_REFRESH_BUFFER_SECONDS = 300
+const COPILOT_MODEL_LIST_PATH = '/models'
+const COPILOT_MODEL_CACHE_TTL_MS = 15 * 60 * 1000
 
 const COPILOT_HEADERS = {
     'Editor-Version': 'vscode/1.96.2',
@@ -17,12 +19,127 @@ const COPILOT_HEADERS = {
 }
 
 const copilotTokenCache = new Map<string, { token: string; expiresAt: number }>()
+const copilotModelCache = new Map<string, { models: INodeOptionsValue[]; expiresAt: number }>()
 
 const normalizeExpiresAt = (expiresAt: number) => {
     if (expiresAt > 1_000_000_000_000) {
         return Math.floor(expiresAt / 1000)
     }
     return expiresAt
+}
+
+const normalizeBaseUrl = (baseUrl?: string) => {
+    const trimmed = baseUrl?.trim()
+    if (!trimmed) {
+        return DEFAULT_BASE_URL
+    }
+    return trimmed.replace(/\/+$/, '')
+}
+
+const parseAdditionalHeaders = (baseOptions: unknown): Record<string, string> | undefined => {
+    if (!baseOptions) return undefined
+    try {
+        return typeof baseOptions === 'object' ? (baseOptions as Record<string, string>) : JSON.parse(baseOptions as string)
+    } catch (exception) {
+        throw new Error("Invalid JSON in the GitHub Copilot's Additional Headers: " + exception)
+    }
+}
+
+const getCachedCopilotModels = (cacheKey: string) => {
+    const cached = copilotModelCache.get(cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.models
+    }
+    if (cached) {
+        copilotModelCache.delete(cacheKey)
+    }
+    return undefined
+}
+
+const cacheCopilotModels = (cacheKey: string, models: INodeOptionsValue[]) => {
+    if (!models.length) return
+    copilotModelCache.set(cacheKey, { models, expiresAt: Date.now() + COPILOT_MODEL_CACHE_TTL_MS })
+}
+
+const buildModelCacheKey = (tokenCacheKey: string, baseUrl: string, additionalHeaders?: Record<string, string>) => {
+    if (!additionalHeaders) {
+        return `copilot-models:${tokenCacheKey}:${baseUrl}`
+    }
+    const headerKey = Object.keys(additionalHeaders)
+        .sort()
+        .map((key) => `${key}:${additionalHeaders[key]}`)
+        .join('|')
+    return `copilot-models:${tokenCacheKey}:${baseUrl}:${headerKey}`
+}
+
+const normalizeCopilotModels = (payload: unknown): INodeOptionsValue[] => {
+    const options: INodeOptionsValue[] = []
+    const seen = new Set<string>()
+
+    const addModel = (name?: string, label?: string) => {
+        if (!name) return
+        const trimmed = name.trim()
+        if (!trimmed || seen.has(trimmed)) return
+        seen.add(trimmed)
+        options.push({
+            label: label?.trim() || trimmed,
+            name: trimmed
+        })
+    }
+
+    const readItem = (item: any) => {
+        if (!item) return
+        if (typeof item === 'string') {
+            addModel(item)
+            return
+        }
+        if (typeof item === 'object') {
+            addModel(item.id ?? item.name ?? item.model ?? item.slug, item.label ?? item.display_name ?? item.displayName)
+        }
+    }
+
+    if (Array.isArray(payload)) {
+        payload.forEach(readItem)
+        return options
+    }
+
+    const data = (payload as any)?.data
+    const models = (payload as any)?.models
+    const items = (payload as any)?.items
+
+    if (Array.isArray(data)) {
+        data.forEach(readItem)
+    } else if (Array.isArray(models)) {
+        models.forEach(readItem)
+    } else if (Array.isArray(items)) {
+        items.forEach(readItem)
+    }
+
+    return options
+}
+
+const fetchCopilotModels = async (
+    copilotToken: string,
+    baseUrl: string,
+    additionalHeaders?: Record<string, string>
+): Promise<INodeOptionsValue[]> => {
+    const fetch = (await import('node-fetch')).default
+    const response = await fetch(`${normalizeBaseUrl(baseUrl)}${COPILOT_MODEL_LIST_PATH}`, {
+        headers: {
+            Authorization: `Bearer ${copilotToken}`,
+            Accept: 'application/json',
+            ...COPILOT_HEADERS,
+            ...(additionalHeaders ?? {})
+        }
+    })
+
+    if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(`Failed to get Copilot models: ${response.status} ${response.statusText} - ${errorText}`)
+    }
+
+    const data = await response.json()
+    return normalizeCopilotModels(data)
 }
 
 const getCachedCopilotToken = (cacheKey: string, credentialData: ICommonObject) => {
@@ -199,8 +316,48 @@ class ChatGitHubCopilot_ChatModels implements INode {
 
     //@ts-ignore
     loadMethods = {
-        async listModels(): Promise<INodeOptionsValue[]> {
-            return await getModels(MODEL_TYPE.CHAT, 'chatGitHubCopilot')
+        async listModels(nodeData: INodeData, options: ICommonObject): Promise<INodeOptionsValue[]> {
+            const fallbackModels = await getModels(MODEL_TYPE.CHAT, 'chatGitHubCopilot')
+            const resolvedNodeData = {
+                ...nodeData,
+                inputs: nodeData.inputs ?? {}
+            }
+            const credentialId =
+                (resolvedNodeData.inputs as ICommonObject)?.credentialId || (resolvedNodeData.credential as string | undefined)
+
+            if (!credentialId) {
+                return fallbackModels
+            }
+
+            const credentialData = await getCredentialData(credentialId, options)
+            const githubAccessToken = getCredentialParam('githubAccessToken', credentialData, resolvedNodeData as INodeData)
+
+            if (!githubAccessToken) {
+                return fallbackModels
+            }
+
+            const baseUrl = normalizeBaseUrl(resolvedNodeData.inputs?.basepath as string | undefined)
+            const additionalHeaders = parseAdditionalHeaders(resolvedNodeData.inputs?.baseOptions)
+            const tokenCacheKey = credentialId || githubAccessToken
+            const cacheKey = buildModelCacheKey(tokenCacheKey, baseUrl, additionalHeaders)
+            const cachedModels = getCachedCopilotModels(cacheKey)
+
+            if (cachedModels) {
+                return cachedModels
+            }
+
+            try {
+                const copilotToken = await getCopilotToken(tokenCacheKey, githubAccessToken, credentialData)
+                const models = await fetchCopilotModels(copilotToken, baseUrl, additionalHeaders)
+                if (models.length) {
+                    cacheCopilotModels(cacheKey, models)
+                    return models
+                }
+            } catch (error) {
+                return fallbackModels
+            }
+
+            return fallbackModels
         }
     }
 
@@ -247,15 +404,7 @@ class ChatGitHubCopilot_ChatModels implements INode {
             obj.stop = stopSequenceArray
         }
 
-        let parsedBaseOptions: Record<string, string> | undefined = undefined
-
-        if (baseOptions) {
-            try {
-                parsedBaseOptions = typeof baseOptions === 'object' ? baseOptions : JSON.parse(baseOptions)
-            } catch (exception) {
-                throw new Error("Invalid JSON in the GitHub Copilot's Additional Headers: " + exception)
-            }
-        }
+        const parsedBaseOptions = parseAdditionalHeaders(baseOptions)
 
         obj.configuration = {
             baseURL: basePath || DEFAULT_BASE_URL,
